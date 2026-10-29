@@ -1,0 +1,25 @@
+# mbfs/__init__.py
+"""
+MBFS: MDP-based Feature Selection with Thompson Sampling
+"""
+
+from .core import MBFSThompson
+from .evaluation import evaluate_selection
+from .datasets import (
+    generate_regression_data1,
+    generate_regression_data2,
+    generate_multiclass_data3,
+    generate_multiclass_data4
+)
+from .experiment import run_multiple_experiments
+
+__version__ = "1.0.0"
+__all__ = [
+    'MBFSThompson',
+    'evaluate_selection',
+    'generate_regression_data1',
+    'generate_regression_data2',
+    'generate_multiclass_data3',
+    'generate_multiclass_data4',
+    'run_multiple_experiments'
+]

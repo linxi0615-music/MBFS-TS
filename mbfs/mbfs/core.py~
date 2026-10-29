@@ -1,0 +1,446 @@
+# mbfs/core.py
+"""
+核心算法: MDP + Thompson Sampling 特征选择
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.svm import SVC, LinearSVC, SVR
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.model_selection import StratifiedKFold, cross_val_score, KFold
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+import time
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+class MBFSThompson:
+    """
+    MDP-based Feature Selection with Thompson Sampling
+
+    基于马尔可夫决策过程和汤普森采样的特征选择算法
+
+    Parameters
+    ----------
+    n_features : int
+        总特征数 p
+    n_episodes : int, default=200
+        迭代轮数
+    alpha_td : float, default=0.1
+        TD学习率
+    gamma : float, default=0.9
+        折扣因子
+    beta_prior : tuple, default=(1.0, 1.0)
+        Beta先验参数 (a0, b0)
+    random_state : int, default=42
+        随机种子
+    max_episode_steps : int, default=50
+        每个 episode 最多添加的特征数量
+    early_stopping_patience : int, default=10
+        早停耐心值
+    reward_estimator : str, default='logistic_l1'
+        用于计算奖励的估计器类型
+        可选: 'logistic_l1', 'linear_svc_l1', 'svm_linear', 'svm_rbf',
+              'linear_regression', 'svr_linear', 'svr_rbf'
+    estimator_C : float, default=0.1
+        估计器C参数（正则化强度倒数）
+    task : str, default='classification'
+        任务类型: 'classification' 或 'regression'
+
+    Attributes
+    ----------
+    alpha : ndarray
+        Beta分布alpha参数
+    beta : ndarray
+        Beta分布beta参数
+    state_value_cache : dict
+        状态价值缓存
+    performance_cache : dict
+        性能缓存
+    """
+
+    def __init__(self, n_features, n_episodes=200, alpha_td=0.1, gamma=0.9,
+                 beta_prior=(1.0, 1.0), random_state=42, max_episode_steps=50,
+                 early_stopping_patience=10,
+                 reward_estimator='logistic_l1',
+                 estimator_C=0.1,
+                 task='classification'):
+
+        self.n_features = n_features
+        self.n_episodes = n_episodes
+        self.alpha_td = alpha_td
+        self.gamma = gamma
+        self.beta_prior = beta_prior
+        self.random_state = random_state
+        self.max_episode_steps = max_episode_steps
+        self.early_stopping_patience = early_stopping_patience
+        self.reward_estimator_type = reward_estimator
+        self.estimator_C = estimator_C
+        self.task = task
+
+        np.random.seed(random_state)
+
+        # 每个特征的 Beta 分布参数，初始化为先验
+        self.alpha = np.full(n_features, beta_prior[0])
+        self.beta = np.full(n_features, beta_prior[1])
+
+        # 存储状态价值 V(s)
+        self.state_value_cache = {}
+
+        # 存储状态对应的估计器性能（避免重复计算）
+        self.performance_cache = {}
+
+        # 内部数据
+        self._X = None
+        self._y = None
+        self._scaler = None
+
+    def compute_adjusted_r2(self, selected_idx):
+        """
+        计算特征子集的调整R方（用于回归任务）
+
+        Parameters
+        ----------
+        selected_idx : list
+            选中的特征索引列表
+
+        Returns
+        -------
+        float
+            调整R方值
+        """
+        key = tuple(sorted(selected_idx))
+        if key in self.performance_cache:
+            return self.performance_cache[key]
+
+        if len(selected_idx) == 0:
+            self.performance_cache[key] = 0.0
+            return 0.0
+
+        X_sel = self._X.iloc[:, selected_idx]
+        regressor = LinearRegression()
+
+        kf = KFold(n_splits=5, shuffle=True, random_state=self.random_state)
+        r2_scores = []
+
+        for train_idx, val_idx in kf.split(X_sel):
+            X_train, X_val = X_sel.iloc[train_idx], X_sel.iloc[val_idx]
+            y_train, y_val = self._y.iloc[train_idx], self._y.iloc[val_idx]
+
+            regressor.fit(X_train, y_train)
+            y_pred = regressor.predict(X_val)
+
+            ss_res = np.sum((y_val - y_pred) ** 2)
+            ss_tot = np.sum((y_val - np.mean(y_val)) ** 2)
+            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+            n = len(y_val)
+            p = len(selected_idx)
+            if n > p + 1:
+                adjusted_r2 = 1 - (1 - r2) * (n - 1) / (n - p - 1)
+            else:
+                adjusted_r2 = r2
+
+            r2_scores.append(adjusted_r2)
+
+        mean_adjusted_r2 = np.mean(r2_scores)
+        self.performance_cache[key] = mean_adjusted_r2
+        return mean_adjusted_r2
+
+    def compute_accuracy(self, selected_idx):
+        """
+        计算特征子集的分类器交叉验证准确率
+
+        Parameters
+        ----------
+        selected_idx : list
+            选中的特征索引列表
+
+        Returns
+        -------
+        float
+            交叉验证准确率
+        """
+        key = tuple(sorted(selected_idx))
+        if key in self.performance_cache:
+            return self.performance_cache[key]
+
+        if len(selected_idx) == 0:
+            unique, counts = np.unique(self._y, return_counts=True)
+            majority_class = unique[np.argmax(counts)]
+            accuracy = np.mean(self._y == majority_class)
+            self.performance_cache[key] = accuracy
+            return accuracy
+
+        X_sel = self._X.iloc[:, selected_idx]
+
+        # 根据 reward_estimator_type 选择分类器
+        if self.reward_estimator_type == 'logistic_l1':
+            if len(np.unique(self._y)) > 2:
+                classifier = LogisticRegression(penalty='l1', solver='liblinear',
+                                                C=self.estimator_C,
+                                                multi_class='ovr',
+                                                random_state=self.random_state,
+                                                max_iter=1000)
+            else:
+                classifier = LogisticRegression(penalty='l1', solver='liblinear',
+                                                C=self.estimator_C,
+                                                random_state=self.random_state,
+                                                max_iter=1000)
+        elif self.reward_estimator_type == 'linear_svc_l1':
+            classifier = LinearSVC(penalty='l1', dual=False, C=self.estimator_C,
+                                   random_state=self.random_state, max_iter=1000)
+        elif self.reward_estimator_type == 'svm_linear':
+            classifier = SVC(kernel='linear', C=self.estimator_C,
+                             random_state=self.random_state, max_iter=1000)
+        elif self.reward_estimator_type == 'svm_rbf':
+            classifier = SVC(kernel='rbf', gamma='scale', C=self.estimator_C,
+                             random_state=self.random_state)
+        else:
+            classifier = SVC(kernel='rbf', gamma='scale', C=self.estimator_C,
+                             random_state=self.random_state)
+
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=self.random_state)
+        scores = cross_val_score(classifier, X_sel, self._y, cv=cv, scoring='accuracy')
+        accuracy = np.mean(scores)
+
+        self.performance_cache[key] = accuracy
+        return accuracy
+
+    def compute_regression_performance(self, selected_idx):
+        """
+        计算特征子集的回归性能（支持SVR）
+
+        Parameters
+        ----------
+        selected_idx : list
+            选中的特征索引列表
+
+        Returns
+        -------
+        float
+            负的MSE（越大越好）或调整R方
+        """
+        key = tuple(sorted(selected_idx))
+        if key in self.performance_cache:
+            return self.performance_cache[key]
+
+        if len(selected_idx) == 0:
+            # 空集：使用均值预测
+            y_mean = np.mean(self._y)
+            mse = np.mean((self._y - y_mean) ** 2)
+            # 返回负的MSE，使其最大化
+            score = -mse
+            self.performance_cache[key] = score
+            return score
+
+        X_sel = self._X.iloc[:, selected_idx]
+
+        # 根据 reward_estimator_type 选择回归器
+        if self.reward_estimator_type == 'linear_regression':
+            regressor = LinearRegression()
+            scoring = 'neg_mean_squared_error'
+        elif self.reward_estimator_type == 'svr_linear':
+            regressor = SVR(kernel='linear', C=self.estimator_C)
+            scoring = 'neg_mean_squared_error'
+        elif self.reward_estimator_type == 'svr_rbf':
+            regressor = SVR(kernel='rbf', C=self.estimator_C, gamma='scale')
+            scoring = 'neg_mean_squared_error'
+        else:
+            regressor = LinearRegression()
+            scoring = 'neg_mean_squared_error'
+
+        # 使用5折交叉验证
+        kf = KFold(n_splits=5, shuffle=True, random_state=self.random_state)
+        scores = cross_val_score(regressor, X_sel, self._y, cv=kf, scoring=scoring)
+        mean_score = np.mean(scores)
+
+        self.performance_cache[key] = mean_score
+        return mean_score
+
+    def compute_performance(self, selected_idx):
+        """
+        根据任务类型计算性能指标
+
+        Parameters
+        ----------
+        selected_idx : list
+            选中的特征索引列表
+
+        Returns
+        -------
+        float
+            性能指标值
+        """
+        if self.task == 'regression':
+            return self.compute_regression_performance(selected_idx)
+        else:
+            return self.compute_accuracy(selected_idx)
+
+    def get_state_value(self, desc):
+        """获取状态价值 V(s)，新状态初始为0"""
+        key = tuple(sorted(desc))
+        return self.state_value_cache.get(key, 0.0)
+
+    def set_state_value(self, desc, value):
+        """设置状态价值 V(s)"""
+        key = tuple(sorted(desc))
+        self.state_value_cache[key] = value
+
+    def run_episode(self):
+        """执行一个episode"""
+        max_steps = min(self.max_episode_steps, self.n_features)
+
+        # 从空集开始
+        current_desc = []
+
+        # 未选中的特征集合，随机打乱顺序
+        available = list(range(self.n_features))
+        np.random.shuffle(available)
+
+        # Episode内部早停计数
+        no_improvement_count = 0
+        max_no_improvement = 5
+
+        for step in range(max_steps):
+            if len(available) == 0:
+                break
+
+            # Thompson Sampling: 从未选中的特征采样θ_i，选择最大的
+            samples = np.random.beta(self.alpha[available], self.beta[available])
+            best_idx_local = np.argmax(samples)
+            f = available[best_idx_local]
+
+            # 定义当前状态 s 和下一个状态 s'
+            s_desc = current_desc
+            s_prime_desc = sorted(current_desc + [f])
+
+            # 获取 V(s) 和 V(s')
+            current_v = self.get_state_value(s_desc)
+            next_v = self.get_state_value(s_prime_desc)
+
+            # 获取 reward
+            current_perf = self.compute_performance(s_desc)
+            next_perf = self.compute_performance(s_prime_desc)
+            r = next_perf - current_perf
+
+            # TD更新
+            td_target = r + self.gamma * next_v
+            updated_current_v = current_v + self.alpha_td * (td_target - current_v)
+            self.set_state_value(s_desc, updated_current_v)
+
+            # 根据TD目标更新Beta分布
+            if td_target > updated_current_v:
+                self.alpha[f] += 1
+            else:
+                self.beta[f] += 1
+
+            # 前进到下一状态
+            current_desc = s_prime_desc
+            available.pop(best_idx_local)
+
+            # Episode内部早停
+            if r <= 0:
+                no_improvement_count += 1
+                if no_improvement_count >= max_no_improvement:
+                    break
+            else:
+                no_improvement_count = 0
+
+        # 为最终状态设置其性能作为价值
+        if len(current_desc) > 0 and self.get_state_value(current_desc) == 0.0:
+            final_perf = self.compute_performance(current_desc)
+            self.set_state_value(current_desc, final_perf)
+
+    def fit_predict(self, X, y, verbose=True):
+        """
+        训练模型并返回theta值
+
+        Parameters
+        ----------
+        X : array-like or pd.DataFrame
+            特征矩阵，形状 (n_samples, n_features)
+        y : array-like or pd.Series
+            目标变量
+        verbose : bool, default=True
+            是否显示进度条
+
+        Returns
+        -------
+        dict
+            包含以下键的字典:
+            - 'theta': 最终的特征重要性分数
+            - 'alpha': Beta分布alpha参数
+            - 'beta': Beta分布beta参数
+            - 'time': 训练耗时（秒）
+        """
+        start_time = time.time()
+
+        # 标准化数据
+        self._scaler = StandardScaler()
+        X_scaled = self._scaler.fit_transform(X)
+        self._X = pd.DataFrame(X_scaled, columns=range(self.n_features))
+        self._y = y if isinstance(y, pd.Series) else pd.Series(y)
+
+        # 重置状态
+        self.state_value_cache = {}
+        self.performance_cache = {}
+        self.alpha = np.full(self.n_features, self.beta_prior[0])
+        self.beta = np.full(self.n_features, self.beta_prior[1])
+
+        # 用于早停的变量
+        best_selected_features_so_far = set()
+        epochs_without_improvement = 0
+        best_theta_final = None
+
+        iterator = tqdm(range(self.n_episodes), desc="MBFS+TS迭代", disable=not verbose)
+
+        for ep in iterator:
+            self.run_episode()
+
+            # 计算当前theta
+            theta_current = self.alpha / (self.alpha + self.beta)
+            current_selected = set(np.where(theta_current > 0.5)[0])
+
+            # 如果一个都没选，回退到theta最大的topq个特征
+            if len(current_selected) == 0 and self.n_features > 0:
+                top_k_fallback = min(5, self.n_features)
+                current_selected = set(np.argsort(theta_current)[-top_k_fallback:])
+
+            # 早停检查
+            if current_selected == best_selected_features_so_far:
+                epochs_without_improvement += 1
+            else:
+                best_selected_features_so_far = current_selected
+                best_theta_final = theta_current.copy()
+                epochs_without_improvement = 0
+
+            if verbose and (ep + 1) % 20 == 0:
+                iterator.set_postfix({
+                    'θ>0.5': len(current_selected),
+                    'max_θ': f'{np.max(theta_current):.3f}',
+                    'NoImpr': epochs_without_improvement
+                })
+
+            if epochs_without_improvement >= self.early_stopping_patience:
+                if verbose:
+                    print(f"\n提前停止训练: 连续{self.early_stopping_patience}轮特征集未变化")
+                break
+
+        # 最终theta
+        theta_final = best_theta_final if best_theta_final is not None else (self.alpha / (self.alpha + self.beta))
+
+        elapsed = time.time() - start_time
+
+        if verbose:
+            print(f"\n训练完成 | 耗时: {elapsed:.2f} 秒")
+            print(f"θ均值: {np.mean(theta_final):.4f}")
+
+        return {
+            'theta': theta_final,
+            'alpha': self.alpha,
+            'beta': self.beta,
+            'time': elapsed
+        }

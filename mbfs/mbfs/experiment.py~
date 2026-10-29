@@ -1,0 +1,136 @@
+# mbfs/experiment.py
+"""
+实验模块 - 运行多次实验并汇总结果
+"""
+
+import numpy as np
+from .core import MBFSThompson
+from .evaluation import evaluate_selection
+
+
+def run_multiple_experiments(data_generator, data_name, n_runs=10,
+                             n=300, p=500, n_signal=5, sigma=3,
+                             n_episodes=100, max_steps=50, alpha_td=0.1, gamma=0.9,
+                             early_stopping_patience=10, random_seed=42,
+                             reward_estimator='logistic_l1',
+                             estimator_C=0.1,
+                             task='classification'):
+    """
+    运行多次实验并输出六个指标的均值和标准差
+    
+    Parameters
+    ----------
+    data_generator : callable
+        数据生成函数
+    data_name : str
+        数据集名称
+    n_runs : int, default=10
+        实验运行次数
+    n : int, default=300
+        样本数
+    p : int, default=500
+        特征数
+    n_signal : int, default=5
+        信号特征数
+    sigma : float, default=3
+        噪声标准差
+    n_episodes : int, default=100
+        迭代轮数
+    max_steps : int, default=50
+        每个episode最大步数
+    alpha_td : float, default=0.1
+        TD学习率
+    gamma : float, default=0.9
+        折扣因子
+    early_stopping_patience : int, default=10
+        早停耐心值
+    random_seed : int, default=42
+        随机种子
+    reward_estimator : str, default='logistic_l1'
+        奖励估计器类型
+    estimator_C : float, default=0.1
+        估计器C参数
+    task : str, default='classification'
+        任务类型
+        
+    Returns
+    -------
+    tuple
+        (summary, all_metrics) - 汇总统计和所有指标
+    """
+    print("\n" + "=" * 80)
+    print(f"数据集: {data_name}")
+    print(f"任务类型: {task}")
+    print("=" * 80)
+    print(f"参数: n={n}, p={p}, n_signal={n_signal}, sigma={sigma}, n_runs={n_runs}")
+    print(f"算法: n_episodes={n_episodes}, max_steps={max_steps}, alpha_td={alpha_td}, gamma={gamma}")
+    print(f"奖励估计器: {reward_estimator} (C={estimator_C})")
+    print("=" * 80)
+
+    # 存储所有实验结果
+    all_metrics = {
+        'FDP': [], 'Precision': [], 'Recall': [], 'F1': [], 
+        'Accuracy': [], 'Hamming': [], 'Time': []
+    }
+
+    all_selected_features = []
+
+    for run in range(n_runs):
+        print(f"\n--- 第 {run + 1}/{n_runs} 次实验 ---")
+
+        # 生成数据
+        seed = random_seed + run
+        X, y, true_idx = data_generator(n=n, p=p, n_signal=n_signal, 
+                                        sigma=sigma, random_state=seed)
+
+        # 训练模型
+        model = MBFSThompson(
+            n_features=p,
+            n_episodes=n_episodes,
+            alpha_td=alpha_td,
+            gamma=gamma,
+            max_episode_steps=max_steps,
+            early_stopping_patience=early_stopping_patience,
+            random_state=seed,
+            reward_estimator=reward_estimator,
+            estimator_C=estimator_C,
+            task=task
+        )
+        results = model.fit_predict(X, y, verbose=True)
+
+        # 评估
+        theta = results['theta']
+        metrics = evaluate_selection(theta, true_idx, topq=n_signal)
+        metrics['Time'] = results['time']
+
+        # 记录结果
+        for key in all_metrics:
+            all_metrics[key].append(metrics[key])
+
+        all_selected_features.append(metrics['selected_features'])
+
+        # 计算命中情况
+        overlap = set(metrics['selected_features']) & set(true_idx)
+        print(f"  真实有效特征: {true_idx}")
+        print(f"  选中特征 (θ值最高的{n_signal}个): {sorted(metrics['selected_features'])}")
+        print(f"  命中特征: {sorted(overlap)}")
+        precision_at_k = len(overlap) / n_signal if n_signal > 0 else 0
+        recall_at_k = len(overlap) / len(true_idx) if len(true_idx) > 0 else 0
+        print(f"  命中精度: {precision_at_k:.4f}, 命中召回: {recall_at_k:.4f}")
+        print(f"  耗时: {results['time']:.2f}秒")
+
+    # 计算均值和标准差
+    print("\n" + "=" * 80)
+    print(f"{data_name} - {n_runs}次实验汇总结果")
+    print("=" * 80)
+
+    summary = {}
+    for key in all_metrics:
+        mean_val = np.mean(all_metrics[key])
+        std_val = np.std(all_metrics[key])
+        summary[key] = {'mean': mean_val, 'std': std_val}
+        print(f"{key:<12}: {mean_val:.6f} ± {std_val:.6f}")
+
+    print("=" * 80)
+
+    return summary, all_metrics
